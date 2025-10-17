@@ -1340,6 +1340,222 @@ def _get_commit_message_with_template(
     return message
 
 
+class cmd_config(Command):
+    """Get and set repository or global options."""
+
+    def run(self, args: Sequence[str]) -> Optional[int]:
+        """Execute the config command.
+
+        Args:
+            args: Command line arguments
+        """
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "--global",
+            dest="global_config",
+            action="store_true",
+            help="Use global config file",
+        )
+        parser.add_argument(
+            "--local",
+            action="store_true",
+            help="Use repository config file (default)",
+        )
+        parser.add_argument(
+            "-l",
+            "--list",
+            action="store_true",
+            help="List all variables",
+        )
+        parser.add_argument(
+            "--unset",
+            action="store_true",
+            help="Remove a variable",
+        )
+        parser.add_argument(
+            "--unset-all",
+            action="store_true",
+            help="Remove all matches for a variable",
+        )
+        parser.add_argument(
+            "--get-all",
+            action="store_true",
+            help="Get all values for a multivar",
+        )
+        parser.add_argument(
+            "key",
+            nargs="?",
+            help="Config key (e.g., user.name)",
+        )
+        parser.add_argument(
+            "value",
+            nargs="?",
+            help="Config value to set",
+        )
+        parsed_args = parser.parse_args(args)
+
+        # Determine which config file to use
+        if parsed_args.global_config:
+            # Use global config file
+            config_path = os.path.expanduser("~/.gitconfig")
+            try:
+                from .config import ConfigFile
+
+                config = ConfigFile.from_path(config_path)
+            except FileNotFoundError:
+                from .config import ConfigFile
+
+                config = ConfigFile()
+                config.path = config_path
+        else:
+            # Use local repository config (default)
+            try:
+                repo = Repo(".")
+                config = repo.get_config()
+            except NotGitRepository:
+                logger.error("error: not a git repository")
+                return 1
+
+        # Handle --list
+        if parsed_args.list:
+            for section in config.sections():
+                for key, value in config.items(section):
+                    section_str = ".".join(
+                        s.decode("utf-8") if isinstance(s, bytes) else s
+                        for s in section
+                    )
+                    key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                    value_str = (
+                        value.decode("utf-8") if isinstance(value, bytes) else value
+                    )
+                    print(f"{section_str}.{key_str}={value_str}")
+            return 0
+
+        # Handle --unset or --unset-all
+        if parsed_args.unset or parsed_args.unset_all:
+            if not parsed_args.key:
+                logger.error("error: key is required for --unset")
+                return 1
+
+            # Parse the key (e.g., "user.name" or "remote.origin.url")
+            parts = parsed_args.key.split(".")
+            if len(parts) < 2:
+                logger.error("error: invalid key format")
+                return 1
+
+            if len(parts) == 2:
+                section = (parts[0],)
+                name = parts[1]
+            else:
+                # For keys like "remote.origin.url", section is ("remote", "origin")
+                section = tuple(parts[:-1])
+                name = parts[-1]
+
+            try:
+                # Check if the key exists first
+                try:
+                    config.get(section, name)
+                except KeyError:
+                    logger.error(f"error: key '{parsed_args.key}' not found")
+                    return 1
+
+                # Delete the configuration key using ConfigDict's delete method
+                section_bytes = tuple(
+                    s.encode("utf-8") if isinstance(s, str) else s for s in section
+                )
+                name_bytes = name.encode("utf-8") if isinstance(name, str) else name
+
+                section_dict = config._values.get(section_bytes)
+                if section_dict:
+                    del section_dict[name_bytes]
+                    config.write_to_path()
+                else:
+                    logger.error(f"error: key '{parsed_args.key}' not found")
+                    return 1
+            except Exception as e:
+                logger.error(f"error: {e}")
+                return 1
+
+            return 0
+
+        # Handle --get-all
+        if parsed_args.get_all:
+            if not parsed_args.key:
+                logger.error("error: key is required for --get-all")
+                return 1
+
+            parts = parsed_args.key.split(".")
+            if len(parts) < 2:
+                logger.error("error: invalid key format")
+                return 1
+
+            if len(parts) == 2:
+                section = (parts[0],)
+                name = parts[1]
+            else:
+                section = tuple(parts[:-1])
+                name = parts[-1]
+
+            try:
+                for value in config.get_multivar(section, name):
+                    value_str = (
+                        value.decode("utf-8") if isinstance(value, bytes) else value
+                    )
+                    print(value_str)
+                return 0
+            except KeyError:
+                return 1
+
+        # Handle get (no value provided)
+        if parsed_args.key and not parsed_args.value:
+            parts = parsed_args.key.split(".")
+            if len(parts) < 2:
+                logger.error("error: invalid key format")
+                return 1
+
+            if len(parts) == 2:
+                section = (parts[0],)
+                name = parts[1]
+            else:
+                # For keys like "remote.origin.url", section is ("remote", "origin")
+                section = tuple(parts[:-1])
+                name = parts[-1]
+
+            try:
+                value = config.get(section, name)
+                value_str = value.decode("utf-8") if isinstance(value, bytes) else value
+                print(value_str)
+                return 0
+            except KeyError:
+                return 1
+
+        # Handle set (key and value provided)
+        if parsed_args.key and parsed_args.value:
+            parts = parsed_args.key.split(".")
+            if len(parts) < 2:
+                logger.error("error: invalid key format")
+                return 1
+
+            if len(parts) == 2:
+                section = (parts[0],)
+                name = parts[1]
+            else:
+                # For keys like "remote.origin.url", section is ("remote", "origin")
+                section = tuple(parts[:-1])
+                name = parts[-1]
+
+            config.set(section, name, parsed_args.value)
+            if parsed_args.global_config:
+                config.write_to_path()
+            else:
+                config.write_to_path()
+            return 0
+
+        # No action specified
+        parser.print_help()
+        return 1
+
+
 class cmd_commit(Command):
     """Record changes to the repository."""
 
@@ -3143,7 +3359,7 @@ class cmd_merge(Command):
             args: Command line arguments
         """
         parser = argparse.ArgumentParser()
-        parser.add_argument("commit", type=str, help="Commit to merge")
+        parser.add_argument("commit", type=str, nargs="+", help="Commit(s) to merge")
         parser.add_argument(
             "--no-commit", action="store_true", help="Do not create a merge commit"
         )
@@ -3154,9 +3370,16 @@ class cmd_merge(Command):
         parsed_args = parser.parse_args(args)
 
         try:
+            # If multiple commits are provided, pass them as a list
+            # If only one commit is provided, pass it as a string
+            if len(parsed_args.commit) == 1:
+                committish = parsed_args.commit[0]
+            else:
+                committish = parsed_args.commit
+
             merge_commit_id, conflicts = porcelain.merge(
                 ".",
-                parsed_args.commit,
+                committish,
                 no_commit=parsed_args.no_commit,
                 no_ff=parsed_args.no_ff,
                 message=parsed_args.message,
@@ -3166,9 +3389,14 @@ class cmd_merge(Command):
                 logger.warning("Merge conflicts in %d file(s):", len(conflicts))
                 for conflict_path in conflicts:
                     logger.warning("  %s", conflict_path.decode())
-                logger.error(
-                    "Automatic merge failed; fix conflicts and then commit the result."
-                )
+                if len(parsed_args.commit) > 1:
+                    logger.error(
+                        "Octopus merge failed; refusing to merge with conflicts."
+                    )
+                else:
+                    logger.error(
+                        "Automatic merge failed; fix conflicts and then commit the result."
+                    )
                 return 1
             elif merge_commit_id is None and not parsed_args.no_commit:
                 logger.info("Already up to date.")
@@ -3176,10 +3404,16 @@ class cmd_merge(Command):
                 logger.info("Automatic merge successful; not committing as requested.")
             else:
                 assert merge_commit_id is not None
-                logger.info(
-                    "Merge successful. Created merge commit %s",
-                    merge_commit_id.decode(),
-                )
+                if len(parsed_args.commit) > 1:
+                    logger.info(
+                        "Octopus merge successful. Created merge commit %s",
+                        merge_commit_id.decode(),
+                    )
+                else:
+                    logger.info(
+                        "Merge successful. Created merge commit %s",
+                        merge_commit_id.decode(),
+                    )
             return 0
         except porcelain.Error as e:
             logger.error("%s", e)
@@ -3351,6 +3585,71 @@ class cmd_notes(SuperCommand):
     }
 
     default_command = cmd_notes_list
+
+
+class cmd_cherry(Command):
+    """Find commits not merged upstream."""
+
+    def run(self, args: Sequence[str]) -> Optional[int]:
+        """Execute the cherry command.
+
+        Args:
+            args: Command line arguments
+
+        Returns:
+            Exit code (0 for success, 1 for error)
+        """
+        parser = argparse.ArgumentParser(description="Find commits not merged upstream")
+        parser.add_argument(
+            "-v",
+            "--verbose",
+            action="store_true",
+            help="Show commit messages",
+        )
+        parser.add_argument(
+            "upstream",
+            nargs="?",
+            help="Upstream branch (default: tracking branch or HEAD^)",
+        )
+        parser.add_argument(
+            "head",
+            nargs="?",
+            help="Head branch (default: HEAD)",
+        )
+        parser.add_argument(
+            "limit",
+            nargs="?",
+            help="Limit commits to those after this ref",
+        )
+        parsed_args = parser.parse_args(args)
+
+        try:
+            results = porcelain.cherry(
+                ".",
+                upstream=parsed_args.upstream,
+                head=parsed_args.head,
+                limit=parsed_args.limit,
+                verbose=parsed_args.verbose,
+            )
+        except (NotGitRepository, OSError, FileFormatException, ValueError) as e:
+            logger.error(f"Error: {e}")
+            return 1
+
+        # Output results
+        for status, commit_sha, message in results:
+            # Convert commit_sha to hex string
+            if isinstance(commit_sha, bytes):
+                commit_hex = commit_sha.hex()
+            else:
+                commit_hex = commit_sha
+
+            if parsed_args.verbose and message:
+                message_str = message.decode("utf-8", errors="replace")
+                logger.info(f"{status} {commit_hex} {message_str}")
+            else:
+                logger.info(f"{status} {commit_hex}")
+
+        return 0
 
 
 class cmd_cherry_pick(Command):
@@ -4319,6 +4618,92 @@ class cmd_format_patch(Command):
                 logger.info(filename)
 
 
+class cmd_mailsplit(Command):
+    """Split mbox or Maildir into individual message files."""
+
+    def run(self, args: Sequence[str]) -> None:
+        """Execute the mailsplit command.
+
+        Args:
+            args: Command line arguments
+        """
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "mbox",
+            nargs="?",
+            help="Path to mbox file or Maildir. If not specified, reads from stdin.",
+        )
+        parser.add_argument(
+            "-o",
+            "--output-directory",
+            dest="output_dir",
+            required=True,
+            help="Directory in which to place the individual messages",
+        )
+        parser.add_argument(
+            "-b",
+            action="store_true",
+            dest="single_mail",
+            help="If any file doesn't begin with a From line, assume it is a single mail message",
+        )
+        parser.add_argument(
+            "-d",
+            dest="precision",
+            type=int,
+            default=4,
+            help="Number of digits for generated filenames (default: 4)",
+        )
+        parser.add_argument(
+            "-f",
+            dest="start_number",
+            type=int,
+            default=1,
+            help="Skip the first <nn> numbers (default: 1)",
+        )
+        parser.add_argument(
+            "--keep-cr",
+            action="store_true",
+            help="Do not remove \\r from lines ending with \\r\\n",
+        )
+        parser.add_argument(
+            "--mboxrd",
+            action="store_true",
+            help='Input is of the "mboxrd" format and "^>+From " line escaping is reversed',
+        )
+        parsed_args = parser.parse_args(args)
+
+        # Determine if input is a Maildir
+        is_maildir = False
+        if parsed_args.mbox:
+            input_path = Path(parsed_args.mbox)
+            if input_path.is_dir():
+                # Check if it's a Maildir (has cur, tmp, new subdirectories)
+                if (
+                    (input_path / "cur").exists()
+                    and (input_path / "tmp").exists()
+                    and (input_path / "new").exists()
+                ):
+                    is_maildir = True
+        else:
+            input_path = None
+
+        # Call porcelain function
+        output_files = porcelain.mailsplit(
+            input_path=input_path,
+            output_dir=parsed_args.output_dir,
+            start_number=parsed_args.start_number,
+            precision=parsed_args.precision,
+            keep_cr=parsed_args.keep_cr,
+            mboxrd=parsed_args.mboxrd,
+            is_maildir=is_maildir,
+        )
+
+        # Print information about the split
+        logger.info(
+            "Split %d messages into %s", len(output_files), parsed_args.output_dir
+        )
+
+
 class cmd_bundle(Command):
     """Create, unpack, and manipulate bundle files."""
 
@@ -4886,10 +5271,12 @@ commands = {
     "check-ignore": cmd_check_ignore,
     "check-mailmap": cmd_check_mailmap,
     "checkout": cmd_checkout,
+    "cherry": cmd_cherry,
     "cherry-pick": cmd_cherry_pick,
     "clone": cmd_clone,
     "commit": cmd_commit,
     "commit-tree": cmd_commit_tree,
+    "config": cmd_config,
     "count-objects": cmd_count_objects,
     "describe": cmd_describe,
     "daemon": cmd_daemon,
@@ -4911,6 +5298,7 @@ commands = {
     "ls-files": cmd_ls_files,
     "ls-remote": cmd_ls_remote,
     "ls-tree": cmd_ls_tree,
+    "mailsplit": cmd_mailsplit,
     "merge": cmd_merge,
     "merge-base": cmd_merge_base,
     "merge-tree": cmd_merge_tree,

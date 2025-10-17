@@ -43,6 +43,7 @@ Currently implemented:
  * ls_files
  * ls_remote
  * ls_tree
+ * mailsplit
  * merge
  * merge_tree
  * mv/move
@@ -5429,20 +5430,155 @@ def _do_merge(
     return (merge_commit_obj.id, [])
 
 
-def merge(
-    repo: Union[str, os.PathLike[str], Repo],
-    committish: Union[str, bytes, Commit, Tag],
+def _do_octopus_merge(
+    r: Repo,
+    merge_commit_ids: list[bytes],
     no_commit: bool = False,
     no_ff: bool = False,
     message: Optional[bytes] = None,
     author: Optional[bytes] = None,
     committer: Optional[bytes] = None,
 ) -> tuple[Optional[bytes], list[bytes]]:
-    """Merge a commit into the current branch.
+    """Internal octopus merge implementation that operates on an open repository.
+
+    Args:
+      r: Open repository object
+      merge_commit_ids: List of commit SHAs to merge
+      no_commit: If True, do not create a merge commit
+      no_ff: If True, force creation of a merge commit (ignored for octopus)
+      message: Optional merge commit message
+      author: Optional author for merge commit
+      committer: Optional committer for merge commit
+
+    Returns:
+      Tuple of (merge_commit_sha, conflicts) where merge_commit_sha is None
+      if no_commit=True or there were conflicts
+    """
+    from .graph import find_octopus_base
+    from .merge import octopus_merge
+
+    # Get HEAD commit
+    try:
+        head_commit_id = r.refs[b"HEAD"]
+    except KeyError:
+        raise Error("No HEAD reference found")
+
+    head_commit = r[head_commit_id]
+    assert isinstance(head_commit, Commit), "Expected a Commit object"
+
+    # Get all commits to merge
+    other_commits = []
+    for merge_commit_id in merge_commit_ids:
+        merge_commit = r[merge_commit_id]
+        assert isinstance(merge_commit, Commit), "Expected a Commit object"
+
+        # Check if we're trying to merge the same commit as HEAD
+        if head_commit_id == merge_commit_id:
+            # Skip this commit, it's already merged
+            continue
+
+        other_commits.append(merge_commit)
+
+    # If no commits to merge after filtering, we're already up to date
+    if not other_commits:
+        return (None, [])
+
+    # If only one commit to merge, use regular merge
+    if len(other_commits) == 1:
+        return _do_merge(
+            r, other_commits[0].id, no_commit, no_ff, message, author, committer
+        )
+
+    # Find the octopus merge base
+    all_commit_ids = [head_commit_id] + [c.id for c in other_commits]
+    merge_bases = find_octopus_base(r, all_commit_ids)
+
+    if not merge_bases:
+        raise Error("No common ancestor found")
+
+    # Check if this is a fast-forward (HEAD is the merge base)
+    # For octopus merges, fast-forward doesn't really apply, so we always create a merge commit
+
+    # Perform octopus merge
+    gitattributes = r.get_gitattributes()
+    config = r.get_config()
+    merged_tree, conflicts = octopus_merge(
+        r.object_store, merge_bases, head_commit, other_commits, gitattributes, config
+    )
+
+    # Add merged tree to object store
+    r.object_store.add_object(merged_tree)
+
+    # Update index and working directory
+    changes = tree_changes(r.object_store, head_commit.tree, merged_tree.id)
+    update_working_tree(r, head_commit.tree, merged_tree.id, change_iterator=changes)
+
+    if conflicts:
+        # Don't create a commit if there are conflicts
+        # Octopus merge refuses to proceed with conflicts
+        return (None, conflicts)
+
+    if no_commit:
+        # Don't create a commit if no_commit is True
+        return (None, [])
+
+    # Create merge commit with multiple parents
+    merge_commit_obj = Commit()
+    merge_commit_obj.tree = merged_tree.id
+    merge_commit_obj.parents = [head_commit_id] + [c.id for c in other_commits]
+
+    # Set author/committer
+    if author is None:
+        author = get_user_identity(r.get_config_stack())
+    if committer is None:
+        committer = author
+
+    merge_commit_obj.author = author
+    merge_commit_obj.committer = committer
+
+    # Set timestamps
+    timestamp = int(time.time())
+    timezone = 0  # UTC
+    merge_commit_obj.author_time = timestamp
+    merge_commit_obj.author_timezone = timezone
+    merge_commit_obj.commit_time = timestamp
+    merge_commit_obj.commit_timezone = timezone
+
+    # Set commit message
+    if message is None:
+        # Generate default message for octopus merge
+        branch_names = []
+        for commit_id in merge_commit_ids:
+            branch_names.append(commit_id.decode()[:7])
+        message = f"Merge commits {', '.join(branch_names)}\n".encode()
+    merge_commit_obj.message = message.encode() if isinstance(message, str) else message
+
+    # Add commit to object store
+    r.object_store.add_object(merge_commit_obj)
+
+    # Update HEAD
+    r.refs[b"HEAD"] = merge_commit_obj.id
+
+    return (merge_commit_obj.id, [])
+
+
+def merge(
+    repo: Union[str, os.PathLike[str], Repo],
+    committish: Union[
+        str, bytes, Commit, Tag, Sequence[Union[str, bytes, Commit, Tag]]
+    ],
+    no_commit: bool = False,
+    no_ff: bool = False,
+    message: Optional[bytes] = None,
+    author: Optional[bytes] = None,
+    committer: Optional[bytes] = None,
+) -> tuple[Optional[bytes], list[bytes]]:
+    """Merge one or more commits into the current branch.
 
     Args:
       repo: Repository to merge into
-      committish: Commit to merge
+      committish: Commit(s) to merge. Can be a single commit or a sequence of commits.
+                  When merging more than two heads, the octopus merge strategy is used.
       no_commit: If True, do not create a merge commit
       no_ff: If True, force creation of a merge commit
       message: Optional merge commit message
@@ -5457,17 +5593,42 @@ def merge(
       Error: If there is no HEAD reference or commit cannot be found
     """
     with open_repo_closing(repo) as r:
-        # Parse the commit to merge
-        try:
-            merge_commit_id = parse_commit(r, committish).id
-        except KeyError:
-            raise Error(
-                f"Cannot find commit '{committish.decode() if isinstance(committish, bytes) else committish}'"
-            )
+        # Handle both single commit and multiple commits
+        if isinstance(committish, (list, tuple)):
+            # Multiple commits - use octopus merge
+            merge_commit_ids = []
+            for c in committish:
+                try:
+                    merge_commit_ids.append(parse_commit(r, c).id)
+                except KeyError:
+                    raise Error(
+                        f"Cannot find commit '{c.decode() if isinstance(c, bytes) else c}'"
+                    )
 
-        result = _do_merge(
-            r, merge_commit_id, no_commit, no_ff, message, author, committer
-        )
+            if len(merge_commit_ids) == 1:
+                # Only one commit, use regular merge
+                result = _do_merge(
+                    r, merge_commit_ids[0], no_commit, no_ff, message, author, committer
+                )
+            else:
+                # Multiple commits, use octopus merge
+                result = _do_octopus_merge(
+                    r, merge_commit_ids, no_commit, no_ff, message, author, committer
+                )
+        else:
+            # Single commit - use regular merge
+            # Type narrowing: committish is not a sequence in this branch
+            single_committish = cast(Union[str, bytes, Commit, Tag], committish)
+            try:
+                merge_commit_id = parse_commit(r, single_committish).id
+            except KeyError:
+                raise Error(
+                    f"Cannot find commit '{single_committish.decode() if isinstance(single_committish, bytes) else single_committish}'"
+                )
+
+            result = _do_merge(
+                r, merge_commit_id, no_commit, no_ff, message, author, committer
+            )
 
         # Trigger auto GC if needed
         from .gc import maybe_auto_gc
@@ -5545,6 +5706,144 @@ def merge_tree(
         r.object_store.add_object(merged_tree)
 
         return merged_tree.id, conflicts
+
+
+def cherry(
+    repo: Union[str, os.PathLike[str], Repo],
+    upstream: Optional[Union[str, bytes]] = None,
+    head: Optional[Union[str, bytes]] = None,
+    limit: Optional[Union[str, bytes]] = None,
+    verbose: bool = False,
+) -> list[tuple[str, bytes, Optional[bytes]]]:
+    """Find commits not merged upstream.
+
+    Args:
+        repo: Repository path or object
+        upstream: Upstream branch (default: tracking branch or @{upstream})
+        head: Head branch (default: HEAD)
+        limit: Limit commits to those after this ref
+        verbose: Include commit messages in output
+
+    Returns:
+        List of tuples (status, commit_sha, message) where status is '+' or '-'
+        '+' means commit is not in upstream, '-' means equivalent patch exists upstream
+        message is None unless verbose=True
+    """
+    from .patch import commit_patch_id
+
+    with open_repo_closing(repo) as r:
+        # Resolve upstream
+        if upstream is None:
+            # Try to find tracking branch
+            upstream_found = False
+            head_refs, _ = r.refs.follow(b"HEAD")
+            if head_refs:
+                head_ref = head_refs[0]
+                if head_ref.startswith(b"refs/heads/"):
+                    config = r.get_config()
+                    branch_name = head_ref[len(b"refs/heads/") :]
+
+                    try:
+                        upstream_ref = config.get((b"branch", branch_name), b"merge")
+                    except KeyError:
+                        upstream_ref = None
+
+                    if upstream_ref:
+                        try:
+                            remote_name = config.get(
+                                (b"branch", branch_name), b"remote"
+                            )
+                        except KeyError:
+                            remote_name = None
+
+                        if remote_name:
+                            # Build the tracking branch ref
+                            upstream_refname = (
+                                b"refs/remotes/"
+                                + remote_name
+                                + b"/"
+                                + upstream_ref.split(b"/")[-1]
+                            )
+                            if upstream_refname in r.refs:
+                                upstream = upstream_refname
+                                upstream_found = True
+
+            if not upstream_found:
+                # Default to HEAD^ if no tracking branch found
+                head_commit = r[b"HEAD"]
+                if isinstance(head_commit, Commit) and head_commit.parents:
+                    upstream = head_commit.parents[0]
+                else:
+                    raise ValueError("Could not determine upstream branch")
+
+        # Resolve head
+        if head is None:
+            head = b"HEAD"
+
+        # Convert strings to bytes
+        if isinstance(upstream, str):
+            upstream = upstream.encode("utf-8")
+        if isinstance(head, str):
+            head = head.encode("utf-8")
+        if limit is not None and isinstance(limit, str):
+            limit = limit.encode("utf-8")
+
+        # Resolve refs to commit IDs
+        assert upstream is not None
+        upstream_obj = r[upstream]
+        head_obj = r[head]
+        upstream_id = upstream_obj.id
+        head_id = head_obj.id
+
+        # Get limit commit ID if specified
+        limit_id = None
+        if limit is not None:
+            limit_id = r[limit].id
+
+        # Find all commits reachable from head but not from upstream
+        # This is equivalent to: git rev-list ^upstream head
+
+        # Get commits from head that are not in upstream
+        walker = r.get_walker([head_id], exclude=[upstream_id])
+        head_commits = []
+        for entry in walker:
+            commit = entry.commit
+            # Apply limit if specified
+            if limit_id is not None:
+                # Stop when we reach the limit commit
+                if commit.id == limit_id:
+                    break
+            head_commits.append(commit.id)
+
+        # Compute patch IDs for upstream commits
+        upstream_walker = r.get_walker([upstream_id])
+        upstream_patch_ids = {}  # Maps patch_id -> commit_id for debugging
+        for entry in upstream_walker:
+            commit = entry.commit
+            pid = commit_patch_id(r.object_store, commit.id)
+            upstream_patch_ids[pid] = commit.id
+
+        # For each head commit, check if equivalent patch exists in upstream
+        results: list[tuple[str, bytes, Optional[bytes]]] = []
+        for commit_id in reversed(head_commits):  # Show oldest first
+            obj = r.object_store[commit_id]
+            assert isinstance(obj, Commit)
+            commit = obj
+
+            pid = commit_patch_id(r.object_store, commit_id)
+
+            if pid in upstream_patch_ids:
+                status = "-"
+            else:
+                status = "+"
+
+            message = None
+            if verbose:
+                message = commit.message.split(b"\n")[0]  # First line only
+
+            results.append((status, commit_id, message))
+
+        return results
 
 
 def cherry_pick(  # noqa: D417
@@ -7172,7 +7471,8 @@ def lfs_fetch(
                         if pointer and pointer.is_valid_oid():
                             # Check if we already have it
                             try:
-                                store.open_object(pointer.oid)
+                                with store.open_object(pointer.oid):
+                                    pass  # Object exists, no need to fetch
                             except KeyError:
                                 pointers_to_fetch.append((pointer.oid, pointer.size))
 
@@ -7359,7 +7659,8 @@ def lfs_status(repo: Union[str, os.PathLike[str], Repo] = ".") -> dict[str, list
 
                     # Check if object exists locally
                     try:
-                        store.open_object(pointer.oid)
+                        with store.open_object(pointer.oid):
+                            pass  # Object exists locally
                     except KeyError:
                         status["missing"].append(path_str)
 
@@ -7667,3 +7968,80 @@ def independent_commits(
 
         # Filter to independent commits
         return independent(r, commit_ids)
+
+
+def mailsplit(
+    input_path: Optional[Union[str, os.PathLike[str], IO[bytes]]] = None,
+    output_dir: Union[str, os.PathLike[str]] = ".",
+    start_number: int = 1,
+    precision: int = 4,
+    keep_cr: bool = False,
+    mboxrd: bool = False,
+    is_maildir: bool = False,
+) -> list[str]:
+    r"""Split an mbox file or Maildir into individual message files.
+
+    This is similar to git mailsplit.
+
+    Args:
+        input_path: Path to mbox file, Maildir, or file-like object. If None, reads from stdin.
+        output_dir: Directory where individual messages will be written
+        start_number: Starting number for output files (default: 1)
+        precision: Number of digits for output filenames (default: 4)
+        keep_cr: If True, preserve \r in lines ending with \r\n (default: False)
+        mboxrd: If True, treat input as mboxrd format and reverse escaping (default: False)
+        is_maildir: If True, treat input_path as a Maildir (default: False)
+
+    Returns:
+        List of output file paths that were created
+
+    Raises:
+        ValueError: If output_dir doesn't exist or input is invalid
+        OSError: If there are issues reading/writing files
+    """
+    from .mbox import split_maildir, split_mbox
+
+    if is_maildir:
+        if input_path is None:
+            raise ValueError("input_path is required for Maildir splitting")
+        if not isinstance(input_path, (str, bytes, os.PathLike)):
+            raise ValueError("Maildir splitting requires a path, not a file object")
+        # Convert PathLike to str for split_maildir
+        maildir_path: Union[str, bytes] = (
+            os.fspath(input_path) if isinstance(input_path, os.PathLike) else input_path
+        )
+        out_dir: Union[str, bytes] = (
+            os.fspath(output_dir) if isinstance(output_dir, os.PathLike) else output_dir
+        )
+        return split_maildir(
+            maildir_path,
+            out_dir,
+            start_number=start_number,
+            precision=precision,
+            keep_cr=keep_cr,
+        )
+    else:
+        from typing import BinaryIO, cast
+
+        if input_path is None:
+            # Read from stdin
+            input_file: Union[str, bytes, BinaryIO] = sys.stdin.buffer
+        else:
+            # Convert PathLike to str if needed
+            if isinstance(input_path, os.PathLike):
+                input_file = os.fspath(input_path)
+            else:
+                # input_path is either str or IO[bytes] here
+                input_file = cast(Union[str, BinaryIO], input_path)
+
+        out_dir = (
+            os.fspath(output_dir) if isinstance(output_dir, os.PathLike) else output_dir
+        )
+        return split_mbox(
+            input_file,
+            out_dir,
+            start_number=start_number,
+            precision=precision,
+            keep_cr=keep_cr,
+            mboxrd=mboxrd,
+        )
